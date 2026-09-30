@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HexSum — Free Online Hash Generator & Checksum Verifier (MD5, SHA-1, SHA-256, SHA-384, SHA-512)</title>
+<meta name="description" content="HexSum is a free online hash generator and checksum verifier. Compute MD5, SHA-1, SHA-256, SHA-384 and SHA-512 for text or files instantly in your browser, verify checksums, and identify unknown hash algorithms. No signup, unlimited free usage.">
+<script src="https://cdn.tailwindcss.com"></script>
+<script id="hexsum-lib">
+/* ============================================================================
+ * HexSum core library — pure, dependency-free hash utilities.
+ * MD5 (RFC 1321) and SHA-1 (FIPS 180-4) implemented in plain JavaScript because
+ * Web Crypto does not provide them. SHA-256/384/512 are handled via Web Crypto
+ * by the page; this lib exposes only sync, testable logic.
+ * Exposed as: globalThis.HexSumLib
+ * ========================================================================== */
+(function () {
+  'use strict';
+
+  /* ---------------- byte / hex helpers ---------------- */
+
+  function bytesToHex(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) {
+      s += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+    }
+    return s;
+  }
+
+  function stringToBytes(str) {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
+    // Fallback (very old runtimes): manual UTF-8 encode
+    var out = [];
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c < 128) out.push(c);
+      else if (c < 2048) { out.push(192 | (c >> 6), 128 | (c & 63)); }
+      else if (c >= 55296 && c <= 56319 && i + 1 < str.length) {
+        var d = str.charCodeAt(++i);
+        c = 65536 + ((c - 55296) << 10) + (d - 57344);
+        out.push(240 | (c >> 18), 128 | ((c >> 12) & 63), 128 | ((c >> 6) & 63), 128 | (c & 63));
+      } else out.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63));
+    }
+    return new Uint8Array(out);
+  }
+
+  /* ---------------- MD5 (RFC 1321, incremental) ---------------- */
+
+  var MD5_S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+               5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+               4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+               6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  var MD5_K = (function () {
+    var k = new Array(64);
+    for (var i = 0; i < 64; i++) k[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) >>> 0;
+    return k;
+  })();
+
+  function MD5Hasher() {
+    this._a = 0x67452301; this._b = 0xefcdab89;
+    this._c = 0x98badcfe; this._d = 0x10325476;
+    this._len = 0;
+    this._buf = new Uint8Array(64);
+    this._bufLen = 0;
+  }
+
+  MD5Hasher.prototype._transform = function (block) {
+    var x = new Uint32Array(16);
+    var dv = new DataView(block.buffer, block.byteOffset, 64);
+    for (var i = 0; i < 16; i++) x[i] = dv.getUint32(i * 4, true);
+    var a = this._a, b = this._b, c = this._c, d = this._d;
+    for (var j = 0; j < 64; j++) {
+      var f, g;
+      if (j < 16)      { f = (b & c) | (~b & d); g = j; }
+      else if (j < 32) { f = (d & b) | (~d & c); g = (5 * j + 1) % 16; }
+      else if (j < 48) { f = b ^ c ^ d;          g = (3 * j + 5) % 16; }
+      else             { f = c ^ (b | ~d);       g = (7 * j) % 16; }
+      f = (f + a + MD5_K[j] + x[g]) >>> 0;
+      a = d; d = c; c = b;
+      var s = MD5_S[j];
+      b = (b + ((f << s) | (f >>> (32 - s)))) >>> 0;
+    }
+    this._a = (this._a + a) >>> 0;
+    this._b = (this._b + b) >>> 0;
+    this._c = (this._c + c) >>> 0;
+    this._d = (this._d + d) >>> 0;
+  };
+
+  MD5Hasher.prototype.update = function (bytes) {
+    var off = 0, remaining = bytes.length;
+    this._len += remaining;
+    if (this._bufLen > 0) {
+      var take = Math.min(64 - this._bufLen, remaining);
+      this._buf.set(bytes.subarray(0, take), this._bufLen);
+      this._bufLen += take; off += take; remaining -= take;
+      if (this._bufLen === 64) { this._transform(this._buf); this._bufLen = 0; }
+    }
+    while (remaining >= 64) {
+      this._transform(bytes.subarray(off, off + 64));
+      off += 64; remaining -= 64;
+    }
+    if (remaining > 0) {
+      this._buf.set(bytes.subarray(off, off + remaining), 0);
+      this._bufLen = remaining;
+    }
+    return this;
+  };
+
+  MD5Hasher.prototype.digest = function () {
+    var bitLen = this._len * 8;
+    var padLen = this._bufLen < 56 ? 56 - this._bufLen : 120 - this._bufLen;
+    var pad = new Uint8Array(padLen);
+    pad[0] = 0x80;
+    this.update(pad);
+    var lenBytes = new Uint8Array(8);
+    var dv = new DataView(lenBytes.buffer);
+    dv.setUint32(0, bitLen >>> 0, true);
+    dv.setUint32(4, Math.floor(bitLen / 4294967296) >>> 0, true);
+    this.update(lenBytes);
+    var words = [this._a, this._b, this._c, this._d];
+    var s = '';
+    for (var i = 0; i < 4; i++)
+      for (var j = 0; j < 4; j++) {
+        var byte = (words[i] >>> (j * 8)) & 255;
+        s += (byte < 16 ? '0' : '') + byte.toString(16);
+      }
+    return s;
+  };
+
+  function md5Hex(bytes) { return new MD5Hasher().update(bytes).digest(); }
+
+  /* ---------------- SHA-1 (FIPS 180-4, incremental) ---------------- */
+
+  function SHA1Hasher() {
+    this._h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    this._len = 0;
+    this._buf = new Uint8Array(64);
+    this._bufLen = 0;
+  }
+
+  function rol(v, n) { return ((v << n) | (v >>> (32 - n))) >>> 0; }
+
+  SHA1Hasher.prototype._transform = function (block) {
+    var w = new Uint32Array(80);
+    var dv = new DataView(block.buffer, block.byteOffset, 64);
+    var i;
+    for (i = 0; i < 16; i++) w[i] = dv.getUint32(i * 4, false);
+    for (i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    var a = this._h[0], b = this._h[1], c = this._h[2], d = this._h[3], e = this._h[4];
+    for (i = 0; i < 80; i++) {
+      var f, k;
+      if (i < 20)      { f = (b & c) | (~b & d); k = 0x5a827999; }
+      else if (i < 40) { f = b ^ c ^ d;          k = 0x6ed9eba1; }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+      else             { f = b ^ c ^ d;          k = 0xca62c1d6; }
+      var t = (rol(a, 5) + f + e + k + w[i]) >>> 0;
+      e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    this._h[0] = (this._h[0] + a) >>> 0;
+    this._h[1] = (this._h[1] + b) >>> 0;
+    this._h[2] = (this._h[2] + c) >>> 0;
+    this._h[3] = (this._h[3] + d) >>> 0;
+    this._h[4] = (this._h[4] + e) >>> 0;
+  };
+
+  SHA1Hasher.prototype.update = MD5Hasher.prototype.update; // identical buffering logic
+
+  SHA1Hasher.prototype.digest = function () {
+    var bitLen = this._len * 8;
+    var padLen = this._bufLen < 56 ? 56 - this._bufLen : 120 - this._bufLen;
+    var pad = new Uint8Array(padLen);
+    pad[0] = 0x80;
+    this.update(pad);
+    var lenBytes = new Uint8Array(8);
+    var dv = new DataView(lenBytes.buffer);
+    dv.setUint32(0, Math.floor(bitLen / 4294967296) >>> 0, false);
+    dv.setUint32(4, bitLen >>> 0, false);
+    this.update(lenBytes);
+    var s = '';
+    for (var i = 0; i < 5; i++)
+      for (var j = 3; j >= 0; j--) {
+        var byte = (this._h[i] >>> (j * 8)) & 255;
+        s += (byte < 16 ? '0' : '') + byte.toString(16);
+      }
+    return s;
+  };
+
+  function sha1Hex(bytes) { return new SHA1Hasher().update(bytes).digest(); }
+
+  /* ---------------- hash identification & verdict ---------------- */
+
+  var ALGO_TABLE = {
+    32:  { algorithm: 'MD5',     bits: 128, note: 'Broken — use for non-security checksums only.' },
+    40:  { algorithm: 'SHA-1',   bits: 160, note: 'Legacy — collisions demonstrated (SHAttered, 2017).' },
+    64:  { algorithm: 'SHA-256', bits: 256, note: 'Secure — the modern default.' },
+    96:  { algorithm: 'SHA-384', bits: 384, note: 'Secure — SHA-2 family, compliance contexts.' },
+    128: { algorithm: 'SHA-512', bits: 512, note: 'Secure — largest output, maximum margin.' }
+  };
+
+  function normalizeHash(raw) {
+    if (raw == null) return '';
+    return String(raw).replace(/[\s:\-]/g, '').toLowerCase();
+  }
+
+  function isHexString(s) {
+    return s.length > 0 && /^[0-9a-f]+$/.test(s);
+  }
+
+  // Returns { algorithm, bits, hexLength, note } or null when unrecognised.
+  function detectAlgorithm(raw) {
+    var h = normalizeHash(raw);
+    if (!isHexString(h)) return null;
+    var entry = ALGO_TABLE[h.length];
+    if (!entry) return null;
+    return {
+      algorithm: entry.algorithm,
+      bits: entry.bits,
+      hexLength: h.length,
+      note: entry.note,
+      hash: h
+    };
+  }
+
+  // Compare two hash strings. Returns { match, valid, algorithm, expected, detail }.
+  function compareHashes(a, b) {
+    var na = normalizeHash(a);
+    var nb = normalizeHash(b);
+    if (!na || !nb) {
+      return { match: false, valid: false, algorithm: null,
+               detail: 'Both a computed hash and an expected hash are needed to verify.' };
+    }
+    if (!isHexString(nb)) {
+      return { match: false, valid: false, algorithm: null,
+               detail: 'Expected value is not valid hexadecimal.' };
+    }
+    var detected = detectAlgorithm(nb);
+    var match = na === nb;
+    return {
+      match: match,
+      valid: true,
+      algorithm: detected ? detected.algorithm : null,
+      expectedLength: nb.length,
+      detail: match
+        ? 'Hashes are identical — integrity confirmed.'
+        : 'Hashes differ — data was altered or corrupted.'
+    };
+  }
+
+  /* ---------------- exports ---------------- */
+
+  globalThis.HexSumLib = {
+    bytesToHex: bytesToHex,
+    stringToBytes: stringToBytes,
+    md5Hex: md5Hex,
+    sha1Hex: sha1Hex,
+    MD5Hasher: MD5Hasher,
+    SHA1Hasher: SHA1Hasher,
+    normalizeHash: normalizeHash,
+    isHexString: isHexString,
+    detectAlgorithm: detectAlgorithm,
+    compareHashes: compareHashes,
+    ALGO_TABLE: ALGO_TABLE
+  };
+})();
+
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Is HexSum free, and do I need to sign up?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. HexSum is completely free with unlimited usage. There is no signup, no account, no paywall and no watermark. Everything runs in your browser, so there is nothing to pay for and nothing to register." }
+    },
+    {
+      "@type": "Question",
+      "name": "Are my files or text uploaded to a server when I hash them?",
+      "acceptedAnswer": { "@type": "Answer", "text": "No. HexSum computes every hash locally in your browser using the Web Crypto API and built-in JavaScript. Your text and files never leave your device. You can even disconnect from the internet after the page loads and hashing will keep working." }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I verify a downloaded file's checksum with HexSum?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Drop the downloaded file into HexSum, wait for the five hashes to appear, then paste the checksum published by the software vendor into the verdict box. HexSum auto-detects the algorithm from the hash length and shows a MATCH or MISMATCH verdict. A match means the file arrived intact; a mismatch means it is corrupt or has been tampered with." }
+    },
+    {
+      "@type": "Question",
+      "name": "Which hash algorithm should I use: MD5, SHA-1, SHA-256, SHA-384 or SHA-512?",
+      "acceptedAnswer": { "@type": "Answer", "text": "For anything security-related, use SHA-256 or SHA-512. MD5 and SHA-1 are broken for security purposes and should only be used for non-security checksums such as detecting accidental corruption or identifying duplicate files. SHA-256 is the modern default; SHA-512 offers the largest security margin and is often faster on 64-bit hardware." }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I use a plain SHA-256 hash to store passwords?",
+      "acceptedAnswer": { "@type": "Answer", "text": "No. Plain SHA-256 is far too fast to be a safe password hash and offers no salt, so identical passwords produce identical hashes that are trivially crackable with GPUs and rainbow tables. Use a dedicated password-hashing function such as bcrypt, scrypt or Argon2id, which are intentionally slow and include automatic salting." }
+    },
+    {
+      "@type": "Question",
+      "name": "How does HexSum identify an unknown hash algorithm?",
+      "acceptedAnswer": { "@type": "Answer", "text": "HexSum looks at the length of the hexadecimal string. A 32-character hash is MD5, 40 is SHA-1, 64 is SHA-256, 96 is SHA-384 and 128 is SHA-512. Paste any hash into the Identify tab and HexSum reports the most likely algorithm, its bit length and a security note." }
+    }
+  ]
+}
+</script>
+<style>
+  .hash-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+  .tab-active { background-color: #FBBF24; color: #451A03; }
+  .tab-idle { background-color: transparent; color: #D6D3D1; }
+  .tab-idle:hover { color: #FBBF24; }
+  .copy-flash { background-color: #FEF3C7 !important; }
+  details.faq-item summary::-webkit-details-marker { display: none; }
+</style>
+</head>
+<body id="top" class="bg-stone-100 text-stone-900 antialiased">
+
+<!-- ============ STICKY HEADER ============ -->
+<header class="sticky top-0 z-50 bg-[#451A03] shadow-lg">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 h-16 flex items-center justify-between">
+    <a href="#top" class="flex items-center gap-2">
+      <span class="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-amber-400 text-[#451A03] font-black text-lg">#</span>
+      <span class="text-2xl font-extrabold tracking-tight text-amber-400">HexSum</span>
+    </a>
+    <nav class="flex items-center gap-5 text-sm font-medium">
+      <a href="#top" class="text-stone-200 hover:text-amber-400 transition">Home</a>
+      <a href="https://fixoraa.tech" class="text-stone-200 hover:text-amber-400 transition">More Tools</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ============ HERO ============ -->
+<section class="bg-gradient-to-br from-[#451A03] via-[#78350A] to-[#451A03] text-stone-100">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 py-10 sm:py-14 text-center">
+    <span class="inline-block rounded-full border border-amber-400/60 bg-amber-400/10 px-4 py-1.5 text-xs font-bold uppercase tracking-[0.18em] text-amber-300">Unlimited Free Usage &middot; No Signup</span>
+    <h1 class="mt-4 text-3xl sm:text-5xl font-extrabold tracking-tight text-white">Hash Generator &amp; Checksum Verifier</h1>
+    <p class="mt-3 max-w-2xl mx-auto text-stone-300 text-sm sm:text-base">Compute <span class="text-amber-300 font-semibold">MD5, SHA-1, SHA-256, SHA-384 &amp; SHA-512</span> for text or files — all five at once, entirely in your browser. Verify checksums and identify unknown hashes in seconds.</p>
+    <div class="mt-5 flex flex-wrap justify-center gap-2 text-[11px] font-semibold">
+      <span class="rounded-full bg-black/30 px-3 py-1 text-amber-200 border border-amber-400/30">100% in-browser</span>
+      <span class="rounded-full bg-black/30 px-3 py-1 text-amber-200 border border-amber-400/30">Nothing uploaded</span>
+      <span class="rounded-full bg-black/30 px-3 py-1 text-amber-200 border border-amber-400/30">Chunked file hashing</span>
+      <span class="rounded-full bg-black/30 px-3 py-1 text-amber-200 border border-amber-400/30">Hash identifier</span>
+    </div>
+  </div>
+</section>
+
+<!-- TOP AD (verbatim) -->
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pt-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <div class="origin-top scale-[0.44] sm:scale-100 shrink-0">
+        <script>
+          atOptions = { 'key' : '4e68ac77881c17fe128a46565d9a4e8c', 'format' : 'iframe', 'height' : 90, 'width' : 728, 'params' : {} };
+        </script>
+        <script src="https://www.highrevenueformat.com/4e68ac77881c17fe128a46565d9a4e8c/invoke.js"></script>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ TOOL ============ -->
+<main class="mx-auto max-w-6xl px-4 sm:px-6 py-6">
+
+  <!-- INPUT LAB PANE -->
+  <section class="rounded-2xl bg-stone-900 shadow-xl ring-1 ring-amber-900/40 overflow-hidden">
+    <div class="flex items-center justify-between px-5 sm:px-7 pt-5">
+      <h2 class="text-lg sm:text-xl font-bold text-amber-300">Hash Lab &mdash; Input</h2>
+      <div class="flex rounded-lg bg-black/40 p-1 text-xs sm:text-sm font-semibold" role="tablist" aria-label="Input mode">
+        <button id="tab-text" role="tab" class="tab-active rounded-md px-3 sm:px-4 py-2 transition" onclick="setMode('text')">Text</button>
+        <button id="tab-file" role="tab" class="tab-idle rounded-md px-3 sm:px-4 py-2 transition" onclick="setMode('file')">File</button>
+        <button id="tab-identify" role="tab" class="tab-idle rounded-md px-3 sm:px-4 py-2 transition" onclick="setMode('identify')">Identify Hash</button>
+      </div>
+    </div>
+
+    <!-- TEXT MODE -->
+    <div id="pane-text" class="px-5 sm:px-7 py-5">
+      <label for="text-input" class="block text-xs font-semibold uppercase tracking-wider text-stone-400 mb-2">Paste or type text to hash</label>
+      <textarea id="text-input" rows="5" placeholder="Type or paste any text here — all five hashes compute live as you type…"
+        class="w-full rounded-xl bg-black/40 border border-stone-700 text-stone-100 placeholder-stone-500 p-4 text-sm hash-mono focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400"></textarea>
+      <div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-stone-400">
+        <span><span id="char-count">0</span> characters &middot; <span id="byte-count">0</span> UTF-8 bytes</span>
+        <span class="flex items-center gap-2">
+          <button onclick="clearText()" class="rounded-md bg-stone-700 hover:bg-stone-600 text-stone-200 px-3 py-1.5 font-semibold transition">Clear</button>
+          <button onclick="hashTextNow()" class="rounded-md bg-amber-400 hover:bg-amber-300 text-[#451A03] px-4 py-1.5 font-bold transition">Compute Hashes</button>
+        </span>
+      </div>
+    </div>
+
+    <!-- FILE MODE -->
+    <div id="pane-file" class="px-5 sm:px-7 py-5 hidden">
+      <div id="drop-zone" class="rounded-xl border-2 border-dashed border-stone-600 bg-black/30 px-6 py-10 text-center cursor-pointer transition hover:border-amber-400 hover:bg-black/50">
+        <div class="text-4xl mb-2">📄</div>
+        <p class="text-stone-200 font-semibold text-sm sm:text-base">Drop a file here, or <span class="text-amber-300 underline">click to browse</span></p>
+        <p class="mt-1 text-xs text-stone-500">Hashed in 4&nbsp;MB chunks &middot; files never leave your device</p>
+        <input id="file-input" type="file" class="hidden">
+      </div>
+      <div id="file-meta" class="hidden mt-3 text-xs text-stone-400"></div>
+      <div class="mt-3 hidden" id="progress-wrap">
+        <div class="h-2.5 rounded-full bg-black/50 overflow-hidden">
+          <div id="progress-bar" class="h-full w-0 bg-amber-400 rounded-full transition-all"></div>
+        </div>
+        <p id="progress-label" class="mt-1 text-xs text-stone-400">Reading file…</p>
+      </div>
+    </div>
+
+    <!-- IDENTIFY MODE -->
+    <div id="pane-identify" class="px-5 sm:px-7 py-5 hidden">
+      <label for="identify-input" class="block text-xs font-semibold uppercase tracking-wider text-stone-400 mb-2">Paste an unknown hash — HexSum guesses the algorithm</label>
+      <input id="identify-input" type="text" spellcheck="false" autocomplete="off" placeholder="e.g. 5d41402abc4b2a76b9719d911017c592"
+        class="w-full rounded-xl bg-black/40 border border-stone-700 text-stone-100 placeholder-stone-500 p-4 text-sm hash-mono focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400">
+      <div id="identify-result" class="mt-3"></div>
+      <p class="mt-2 text-xs text-stone-500">Detection is based on hexadecimal length: 32&thinsp;=&thinsp;MD5, 40&thinsp;=&thinsp;SHA-1, 64&thinsp;=&thinsp;SHA-256, 96&thinsp;=&thinsp;SHA-384, 128&thinsp;=&thinsp;SHA-512.</p>
+    </div>
+  </section>
+
+  <!-- OUTPUT CARDS -->
+  <section class="mt-6">
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+      <h2 class="text-lg sm:text-xl font-bold text-[#451A03]">Digests <span class="text-sm font-medium text-stone-500">&mdash; all five, computed at once</span></h2>
+      <div class="flex items-center gap-2 text-xs">
+        <button onclick="toggleCase()" id="case-btn" class="rounded-md border border-stone-300 bg-white px-3 py-1.5 font-semibold text-stone-700 hover:border-amber-500 transition">UPPERCASE</button>
+        <button onclick="copyAll()" class="rounded-md bg-[#451A03] hover:bg-[#5b2304] text-amber-300 px-3 py-1.5 font-semibold transition">Copy all as JSON</button>
+      </div>
+    </div>
+    <div id="algo-cards" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-1"></div>
+    <p id="no-input-hint" class="mt-2 text-sm text-stone-500 italic">Enter text or choose a file above to generate hashes.</p>
+  </section>
+
+  <!-- VERDICT BOX -->
+  <section class="mt-6 rounded-2xl bg-white shadow ring-1 ring-stone-200 overflow-hidden">
+    <div class="px-5 sm:px-7 py-5">
+      <h2 class="text-lg sm:text-xl font-bold text-[#451A03]">Checksum Verdict <span class="text-sm font-medium text-stone-500">&mdash; paste the expected hash</span></h2>
+      <p class="mt-1 text-xs text-stone-500">HexSum auto-detects the algorithm from the hash length and compares it against the matching computed digest.</p>
+      <div class="mt-3 flex flex-col sm:flex-row gap-2">
+        <input id="expected-input" type="text" spellcheck="false" autocomplete="off" placeholder="Paste the expected / published checksum here…"
+          class="flex-1 rounded-xl border border-stone-300 p-3 text-sm hash-mono focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400">
+        <button onclick="verifyNow()" class="rounded-xl bg-amber-400 hover:bg-amber-300 text-[#451A03] font-bold px-6 py-3 text-sm transition">Verify</button>
+      </div>
+      <div id="verdict-box" class="mt-3 hidden rounded-xl p-4 text-sm"></div>
+    </div>
+  </section>
+
+  <!-- SECURITY GUIDANCE -->
+  <section class="mt-6 rounded-2xl bg-amber-50 ring-1 ring-amber-200 overflow-hidden">
+    <div class="px-5 sm:px-7 py-5">
+      <h2 class="text-lg sm:text-xl font-bold text-[#451A03]">Honest Security Guidance</h2>
+      <div class="mt-3 grid gap-3 sm:grid-cols-3 text-sm">
+        <div class="rounded-xl bg-white p-4 ring-1 ring-red-200">
+          <p class="font-bold text-red-700">MD5 &amp; SHA-1 are legacy</p>
+          <p class="mt-1 text-stone-600 text-[13px]">Both are cryptographically <strong>broken</strong> — attackers can craft two different inputs with the same hash (collisions). Use them only for non-security checksums: spotting accidental corruption, deduplicating files, cache keys. Never for signatures, certificates or integrity you must trust.</p>
+        </div>
+        <div class="rounded-xl bg-white p-4 ring-1 ring-amber-200">
+          <p class="font-bold text-amber-700">SHA-256 / 384 / 512 are secure</p>
+          <p class="mt-1 text-stone-600 text-[13px]">No practical attacks exist against the SHA-2 family. <strong>SHA-256 is the modern default</strong> for file verification and data integrity; SHA-512 gives the biggest security margin and is often faster on 64-bit hardware.</p>
+        </div>
+        <div class="rounded-xl bg-white p-4 ring-1 ring-stone-300">
+          <p class="font-bold text-stone-800">Plain hashes are NOT password storage</p>
+          <p class="mt-1 text-stone-600 text-[13px]">A raw SHA-256 of a password is dangerously weak: it's unsalted and billions of guesses per second are possible on a GPU. For passwords use <strong>bcrypt, scrypt or Argon2id</strong> — deliberately slow, automatically salted password-hashing functions.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- BOTTOM AD (verbatim) -->
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pb-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <script async src="https://js.wpadmngr.com/static/adManager.js" data-admpid="464498"></script>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SEO ARTICLE ============ -->
+<!--ARTICLE-START-->
+<article class="mx-auto max-w-6xl px-4 sm:px-6 pb-10">
+  <div class="rounded-2xl bg-white ring-1 ring-stone-200 px-5 sm:px-10 py-8 prose-stone max-w-none">
+    <h2 class="text-2xl sm:text-3xl font-extrabold text-[#451A03]">Hash Generators, Checksums &amp; File Verification: The Complete Guide</h2>
+
+    <p class="mt-4 text-stone-700 leading-relaxed">Every file you download, every software update you install, and every message you send relies on a quiet mathematical workhorse: the <strong>hash function</strong>. A hash function takes input of any size — a three-letter word or a four-gigabyte disk image — and squeezes it down into a short, fixed-length fingerprint called a <strong>hash</strong>, <strong>digest</strong> or <strong>checksum</strong>. The same input always produces exactly the same fingerprint, while changing even a single character produces a wildly different one. That simple property makes hashes one of the most useful tools in computing, powering everything from download verification to blockchain networks.</p>
+
+    <p class="mt-4 text-stone-700 leading-relaxed">This guide explains what hash generators do, how the five most common algorithms differ, how to verify a file's checksum step by step, how to identify an unknown hash from its length alone, and — just as importantly — where hashes should <em>not</em> be trusted. By the end, you will know exactly which algorithm to reach for and which mistakes to avoid.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">What exactly is a hash function?</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed">A cryptographic hash function is a one-way mathematical transformation with four essential properties. First, it is <strong>deterministic</strong>: hashing the same data twice gives the same result every time. Second, it is <strong>fixed-size</strong>: no matter how large the input, the output is always the same length — 32 hexadecimal characters for MD5, 64 for SHA-256, 128 for SHA-512. Third, it exhibits the <strong>avalanche effect</strong>: flipping one bit of input changes roughly half the output bits, so similar inputs produce completely unrelated hashes. Fourth, it is <strong>one-way</strong>: given only a hash, there is no practical way to reconstruct the original input.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed">Two further properties matter for security. <strong>Collision resistance</strong> means it should be infeasible to find two different inputs that produce the same hash. <strong>Preimage resistance</strong> means that given a target hash, it should be infeasible to find any input that produces it. When an algorithm loses collision resistance — as MD5 did in 2004 and SHA-1 did with Google's SHAttered attack in 2017 — it can no longer be trusted wherever an attacker might benefit from forging a matching fingerprint.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">The five algorithms, explained</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed"><strong>MD5</strong> produces a 128-bit digest shown as 32 hexadecimal characters. Designed in 1992, it is extremely fast and still ubiquitous in legacy systems, but it is cryptographically broken: researchers can deliberately generate two different files with the identical MD5 hash. It remains perfectly fine for non-adversarial jobs such as detecting accidental corruption, identifying duplicate files, or generating cache keys — anywhere speed matters and nobody is trying to cheat.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed"><strong>SHA-1</strong> produces a 160-bit digest (40 hex characters). It was the dominant standard for more than a decade — Git still uses it for commit identifiers — but practical collision attacks have been demonstrated, so it is deprecated for security use. You will still encounter SHA-1 checksums published alongside older software releases; treat them as weak evidence, not proof.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed"><strong>SHA-256</strong> produces a 256-bit digest (64 hex characters) and is the current gold standard for general use. It secures Bitcoin, TLS certificates, software distribution channels and countless APIs. No practical attack against SHA-256 is known, and cryptographers consider it safe for the foreseeable future. When in doubt, <strong>SHA-256 is the algorithm you should choose</strong>.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed"><strong>SHA-384</strong> produces a 384-bit digest (96 hex characters). It belongs to the same SHA-2 family as SHA-256 but truncates the output of the SHA-512 computation, giving a larger security margin. You will mostly meet it in enterprise certificate infrastructure and government compliance contexts that mandate longer digests.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed"><strong>SHA-512</strong> produces a 512-bit digest (128 hex characters) — the largest output of the five, and therefore the largest safety margin. Counterintuitively, it is often 20–30% <em>faster</em> than SHA-256 on modern 64-bit processors, because its internal operations are natively 64-bit. Choose SHA-512 when you want maximum assurance or when benchmarking shows it is faster on your hardware.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">Checksums: verifying that a download is intact</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed">The most common everyday use of a hash generator is <strong>checksum verification</strong>. When you download an operating-system ISO, a firmware update, or any large installer, the vendor publishes a checksum — usually SHA-256 — next to the download link. After downloading, you compute the hash of your copy and compare the two strings character by character. If they match exactly, the file arrived intact and unmodified. If they differ, the download is corrupt or has been tampered with, and you should delete it and re-download from an official mirror.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed">This matters because downloads can be corrupted by flaky networks, interrupted transfers, or failing storage — and, more seriously, because attackers occasionally compromise download mirrors to distribute malware disguised as legitimate software. A checksum comparison is a thirty-second habit that defeats both problems at once, provided you fetch the published checksum from the vendor's official site (ideally over HTTPS) rather than from the same mirror as the file.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed">HexSum streamlines this workflow: drop the file into the tool, let it compute all five digests, then paste the vendor's published checksum into the verdict box. HexSum detects which algorithm the checksum uses from its length and immediately reports <strong>MATCH</strong> or <strong>MISMATCH</strong> — no manual string comparison, no squinting at 64-character strings.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">Identifying an unknown hash by its length</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed">Hashes frequently appear without labels — in a database column, a log file, a bug report, or a CTF challenge. Because each algorithm has a fixed output size, the length of the hexadecimal string is a reliable first clue. Count the characters: <strong>32 means MD5</strong> (128 bits), <strong>40 means SHA-1</strong> (160 bits), <strong>64 means SHA-256</strong> (256 bits), <strong>96 means SHA-384</strong> (384 bits), and <strong>128 means SHA-512</strong> (512 bits).</p>
+    <p class="mt-3 text-stone-700 leading-relaxed">There are caveats worth knowing. A 32-character hash could also be NTLM (the Windows password hash, which is MD4-based) or another 128-bit construction — length narrows the field but does not prove the algorithm. Salted or iterated password hashes look different again: strings beginning with <strong>$2y$</strong> or <strong>$2b$</strong> are bcrypt, <strong>$6$</strong> indicates SHA-512-crypt, and <strong>$y$</strong> marks yescrypt. HexSum's identifier handles the five common unsalted digests and tells you the bit length and security status of each, which covers the vast majority of checksums you will meet in the wild.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">Hashing text vs. hashing files</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed">Hashing text is straightforward, but one subtlety trips people up: <strong>encoding</strong>. A hash is computed over bytes, not characters, so the same text hashed as UTF-8 versus UTF-16 produces different digests. HexSum always encodes text as UTF-8 — the web's universal standard — so its results match the <code>echo -n "text" | sha256sum</code> output on Linux and macOS. Watch out for trailing newlines: many command-line tools add one, which changes the hash, so HexSum hashes exactly the characters you provide, nothing more.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed">Hashing files introduces a performance question. Loading a multi-gigabyte file into memory at once can freeze a browser tab, so HexSum reads files in <strong>4&nbsp;MB chunks</strong>, feeding each chunk into the hash state incrementally and showing a progress bar. MD5 and SHA-1 use built-in pure-JavaScript implementations (browsers' Web Crypto API does not provide them), while SHA-256, SHA-384 and SHA-512 use the browser's native, hardware-accelerated cryptography. Everything happens locally — your files are never uploaded anywhere, which is also why the tool keeps working if you go offline after the page loads.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">Where hashes shine — and where they don't</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed">Beyond download verification, hashes quietly power modern computing. <strong>Data deduplication</strong> systems hash file chunks to spot identical data without comparing entire files. <strong>Content-addressed storage</strong> — used by Git, Docker image layers and IPFS — names objects by their hash, so identical content is stored once and any corruption is instantly detectable. <strong>Digital signatures</strong> hash a document first and sign the short digest rather than the whole file. <strong>Commitment schemes</strong> let someone prove they knew a value at a certain time by publishing its hash, revealing the value later. And <strong>blockchains</strong> chain blocks together with hashes so that altering history would require recomputing everything after it.</p>
+    <p class="mt-3 text-stone-700 leading-relaxed">The most important "don't" concerns <strong>password storage</strong>. A plain SHA-256 hash of a password is dangerously inadequate: it is unsalted, so every user with the password "letmein123" shares the identical hash, and it is blindingly fast — a single GPU can try billions of candidates per second, and precomputed rainbow tables crack common passwords instantly. Proper password storage requires a dedicated <strong>password-hashing function</strong> — bcrypt, scrypt or Argon2id — which is intentionally slow, automatically salted, and memory-hard to defeat parallel hardware. If you are building a login system, reach for one of those, never for a raw hash function. HexSum's security panel exists precisely to make this distinction impossible to miss.</p>
+
+    <h3 class="mt-8 text-xl font-bold text-[#451A03]">Practical tips for working with hashes</h3>
+    <p class="mt-3 text-stone-700 leading-relaxed">A few habits will save you headaches. <strong>Compare hashes programmatically or with a verifier</strong> rather than by eye — humans are terrible at spotting a single changed character in a 64-character string, which is why HexSum's verdict box exists. <strong>Normalize before comparing</strong>: strip whitespace and line breaks, and treat uppercase and lowercase hex as equivalent (HexSum does both automatically). <strong>Prefer SHA-256 for new checksums</strong> you publish; it is universally supported and trusted. <strong>Keep MD5 only for non-security fingerprints</strong> such as ETags, cache keys and duplicate detection. And remember that a hash verifies <em>integrity</em>, not <em>authenticity</em>: a matching checksum proves the file wasn't altered in transit, but only a digital signature — or fetching the checksum over a trusted channel — proves it came from who you think it did. For authenticity guarantees, keyed constructions like <strong>HMAC</strong> (a hash combined with a secret key) are the right tool, and they underpin webhook signature verification at companies like Stripe and GitHub.</p>
+    <p class="mt-4 text-stone-700 leading-relaxed">Whether you are verifying an ISO before installing it, fingerprinting data for deduplication, debugging a hash that appears in a log, or simply curious what your name looks like as SHA-512, HexSum gives you all five industry-standard digests in one click — free, unlimited, and entirely private.</p>
+
+    <h3 class="mt-10 text-xl font-bold text-[#451A03]">Frequently Asked Questions</h3>
+    <div class="mt-4 space-y-3">
+      <details class="faq-item rounded-xl ring-1 ring-stone-200 bg-stone-50 open:bg-white transition">
+        <summary class="cursor-pointer px-5 py-4 font-semibold text-[#451A03] list-none flex justify-between items-center">Is HexSum free, and do I need to sign up? <span class="text-amber-600 font-bold">+</span></summary>
+        <p class="px-5 pb-4 text-sm text-stone-600">Yes. HexSum is completely free with unlimited usage. There is no signup, no account, no paywall and no watermark. Everything runs in your browser, so there is nothing to pay for and nothing to register.</p>
+      </details>
+      <details class="faq-item rounded-xl ring-1 ring-stone-200 bg-stone-50 open:bg-white transition">
+        <summary class="cursor-pointer px-5 py-4 font-semibold text-[#451A03] list-none flex justify-between items-center">Are my files or text uploaded to a server when I hash them? <span class="text-amber-600 font-bold">+</span></summary>
+        <p class="px-5 pb-4 text-sm text-stone-600">No. HexSum computes every hash locally in your browser using the Web Crypto API and built-in JavaScript. Your text and files never leave your device. You can even disconnect from the internet after the page loads and hashing will keep working.</p>
+      </details>
+      <details class="faq-item rounded-xl ring-1 ring-stone-200 bg-stone-50 open:bg-white transition">
+        <summary class="cursor-pointer px-5 py-4 font-semibold text-[#451A03] list-none flex justify-between items-center">How do I verify a downloaded file's checksum with HexSum? <span class="text-amber-600 font-bold">+</span></summary>
+        <p class="px-5 pb-4 text-sm text-stone-600">Drop the downloaded file into HexSum, wait for the five hashes to appear, then paste the checksum published by the software vendor into the verdict box. HexSum auto-detects the algorithm from the hash length and shows a MATCH or MISMATCH verdict. A match means the file arrived intact; a mismatch means it is corrupt or has been tampered with.</p>
+      </details>
+      <details class="faq-item rounded-xl ring-1 ring-stone-200 bg-stone-50 open:bg-white transition">
+        <summary class="cursor-pointer px-5 py-4 font-semibold text-[#451A03] list-none flex justify-between items-center">Which hash algorithm should I use: MD5, SHA-1, SHA-256, SHA-384 or SHA-512? <span class="text-amber-600 font-bold">+</span></summary>
+        <p class="px-5 pb-4 text-sm text-stone-600">For anything security-related, use SHA-256 or SHA-512. MD5 and SHA-1 are broken for security purposes and should only be used for non-security checksums such as detecting accidental corruption or identifying duplicate files. SHA-256 is the modern default; SHA-512 offers the largest security margin and is often faster on 64-bit hardware.</p>
+      </details>
+      <details class="faq-item rounded-xl ring-1 ring-stone-200 bg-stone-50 open:bg-white transition">
+        <summary class="cursor-pointer px-5 py-4 font-semibold text-[#451A03] list-none flex justify-between items-center">Can I use a plain SHA-256 hash to store passwords? <span class="text-amber-600 font-bold">+</span></summary>
+        <p class="px-5 pb-4 text-sm text-stone-600">No. Plain SHA-256 is far too fast to be a safe password hash and offers no salt, so identical passwords produce identical hashes that are trivially crackable with GPUs and rainbow tables. Use a dedicated password-hashing function such as bcrypt, scrypt or Argon2id, which are intentionally slow and include automatic salting.</p>
+      </details>
+      <details class="faq-item rounded-xl ring-1 ring-stone-200 bg-stone-50 open:bg-white transition">
+        <summary class="cursor-pointer px-5 py-4 font-semibold text-[#451A03] list-none flex justify-between items-center">How does HexSum identify an unknown hash algorithm? <span class="text-amber-600 font-bold">+</span></summary>
+        <p class="px-5 pb-4 text-sm text-stone-600">HexSum looks at the length of the hexadecimal string. A 32-character hash is MD5, 40 is SHA-1, 64 is SHA-256, 96 is SHA-384 and 128 is SHA-512. Paste any hash into the Identify tab and HexSum reports the most likely algorithm, its bit length and a security note.</p>
+      </details>
+    </div>
+  </div>
+</article>
+<!--ARTICLE-END-->
+
+<!-- ============ FOOTER ============ -->
+<footer class="bg-[#451A03] text-stone-300">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4">
+    <div class="flex items-center gap-2">
+      <span class="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-amber-400 text-[#451A03] font-black">#</span>
+      <span class="text-xl font-extrabold text-amber-400">HexSum</span>
+      <span class="text-xs text-stone-400">— free hash generator &amp; checksum verifier</span>
+    </div>
+    <nav class="flex items-center gap-5 text-sm">
+      <a href="#top" class="hover:text-amber-400 transition">Home</a>
+      <a href="https://fixoraa.tech" class="hover:text-amber-400 transition">More Tools</a>
+    </nav>
+  </div>
+  <p class="text-center text-[11px] text-stone-500 pb-6 px-4">All hashing happens locally in your browser. Nothing is uploaded, stored, or tracked.</p>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+  var L = window.HexSumLib;
+  var state = { mode: 'text', hashes: null, upper: false, fileName: '', fileSize: 0 };
+
+  var ALGOS = [
+    { key: 'md5',    name: 'MD5',     bits: 128, hexLen: 32,  webcrypto: null,      badge: 'Legacy — broken',  badgeCls: 'bg-red-100 text-red-700 ring-red-200' },
+    { key: 'sha1',   name: 'SHA-1',   bits: 160, hexLen: 40,  webcrypto: null,      badge: 'Legacy — weak',    badgeCls: 'bg-orange-100 text-orange-700 ring-orange-200' },
+    { key: 'sha256', name: 'SHA-256', bits: 256, hexLen: 64,  webcrypto: 'SHA-256', badge: 'Secure — default', badgeCls: 'bg-green-100 text-green-700 ring-green-200' },
+    { key: 'sha384', name: 'SHA-384', bits: 384, hexLen: 96,  webcrypto: 'SHA-384', badge: 'Secure',           badgeCls: 'bg-green-100 text-green-700 ring-green-200' },
+    { key: 'sha512', name: 'SHA-512', bits: 512, hexLen: 128, webcrypto: 'SHA-512', badge: 'Secure — strongest', badgeCls: 'bg-green-100 text-green-700 ring-green-200' }
+  ];
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    var u = ['KB', 'MB', 'GB', 'TB'], i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return n.toFixed(2) + ' ' + u[i];
+  }
+
+  function fmtHash(h) { return state.upper ? h.toUpperCase() : h.toLowerCase(); }
+
+  function renderCards() {
+    var wrap = document.getElementById('algo-cards');
+    var html = '';
+    ALGOS.forEach(function (a) {
+      var val = state.hashes ? fmtHash(state.hashes[a.key]) : '—';
+      var placeholder = state.hashes ? '' : ' text-stone-300';
+      html += '<div class="rounded-xl bg-white ring-1 ring-stone-200 shadow-sm overflow-hidden">' +
+        '<div class="flex items-center justify-between px-4 sm:px-5 py-2.5 bg-stone-50 border-b border-stone-200">' +
+          '<div class="flex items-center gap-2">' +
+            '<span class="font-bold text-[#451A03]">' + a.name + '</span>' +
+            '<span class="text-[11px] text-stone-500">' + a.bits + '-bit &middot; ' + a.hexLen + ' hex chars</span>' +
+          '</div>' +
+          '<span class="text-[10px] font-bold uppercase tracking-wide rounded-full px-2.5 py-1 ring-1 ' + a.badgeCls + '">' + a.badge + '</span>' +
+        '</div>' +
+        '<div class="flex items-start gap-2 px-4 sm:px-5 py-3">' +
+          '<code id="hash-' + a.key + '" class="hash-mono flex-1 text-[12px] sm:text-[13px] leading-relaxed text-stone-800' + placeholder + '">' + val + '</code>' +
+          '<button onclick="copyHash(\'' + a.key + '\', this)" ' + (state.hashes ? '' : 'disabled') +
+            ' class="shrink-0 rounded-md bg-stone-100 hover:bg-amber-100 border border-stone-200 hover:border-amber-400 text-stone-600 hover:text-[#451A03] text-xs font-semibold px-2.5 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed">Copy</button>' +
+        '</div></div>';
+    });
+    wrap.innerHTML = html;
+    document.getElementById('no-input-hint').style.display = state.hashes ? 'none' : 'block';
+    // re-run verdict if an expected hash was pasted
+    var exp = document.getElementById('expected-input').value.trim();
+    if (exp && state.hashes) verifyNow();
+  }
+
+  function copyText(t, btn) {
+    function done() {
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = 'Copied!';
+      btn.classList.add('copy-flash');
+      setTimeout(function () { btn.textContent = old; btn.classList.remove('copy-flash'); }, 1200);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(done, function () { fallback(); });
+    } else fallback();
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta); done();
+    }
+  }
+
+  window.copyHash = function (key, btn) {
+    if (!state.hashes) return;
+    copyText(fmtHash(state.hashes[key]), btn);
+  };
+
+  window.copyAll = function () {
+    if (!state.hashes) return;
+    var o = { tool: 'HexSum' };
+    if (state.fileName) { o.file = state.fileName; o.size_bytes = state.fileSize; }
+    ALGOS.forEach(function (a) { o[a.key] = fmtHash(state.hashes[a.key]); });
+    copyText(JSON.stringify(o, null, 2), document.querySelector('button[onclick="copyAll()"]'));
+  };
+
+  window.toggleCase = function () {
+    state.upper = !state.upper;
+    document.getElementById('case-btn').textContent = state.upper ? 'lowercase' : 'UPPERCASE';
+    try { localStorage.setItem('hexsum-case', state.upper ? 'upper' : 'lower'); } catch (e) {}
+    renderCards();
+  };
+
+  async function sha2hex(bytes, name) {
+    var copy = bytes.slice ? bytes.slice() : new Uint8Array(bytes);
+    var buf = await crypto.subtle.digest(name, copy);
+    return L.bytesToHex(new Uint8Array(buf));
+  }
+
+  async function hashBytes(bytes) {
+    var subtleOK = !!(window.crypto && crypto.subtle);
+    var out = { md5: L.md5Hex(bytes), sha1: L.sha1Hex(bytes) };
+    if (subtleOK) {
+      var r = await Promise.all([
+        sha2hex(bytes, 'SHA-256'), sha2hex(bytes, 'SHA-384'), sha2hex(bytes, 'SHA-512')
+      ]);
+      out.sha256 = r[0]; out.sha384 = r[1]; out.sha512 = r[2];
+    } else {
+      out.sha256 = out.sha384 = out.sha512 = 'unavailable — SHA-2 needs a secure context (HTTPS or localhost)';
+    }
+    return out;
+  }
+
+  var debounce = null;
+  window.hashTextNow = async function () {
+    var text = document.getElementById('text-input').value;
+    document.getElementById('char-count').textContent = text.length;
+    var bytes = L.stringToBytes(text);
+    document.getElementById('byte-count').textContent = bytes.length;
+    if (text.length === 0) { state.hashes = null; state.fileName = ''; renderCards(); return; }
+    state.hashes = await hashBytes(bytes);
+    state.fileName = ''; state.fileSize = 0;
+    renderCards();
+  };
+
+  document.getElementById('text-input').addEventListener('input', function () {
+    clearTimeout(debounce);
+    debounce = setTimeout(window.hashTextNow, 300);
+  });
+
+  window.clearText = function () {
+    document.getElementById('text-input').value = '';
+    window.hashTextNow();
+  };
+
+  /* ---------- file mode ---------- */
+  var dropZone = document.getElementById('drop-zone');
+  var fileInput = document.getElementById('file-input');
+  dropZone.addEventListener('click', function () { fileInput.click(); });
+  fileInput.addEventListener('change', function () { if (fileInput.files[0]) hashFile(fileInput.files[0]); });
+  ['dragover', 'dragenter'].forEach(function (ev) {
+    dropZone.addEventListener(ev, function (e) { e.preventDefault(); dropZone.classList.add('border-amber-400'); });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    dropZone.addEventListener(ev, function (e) { e.preventDefault(); dropZone.classList.remove('border-amber-400'); });
+  });
+  dropZone.addEventListener('drop', function (e) {
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) hashFile(f);
+  });
+
+  async function hashFile(file) {
+    var CHUNK = 4 * 1024 * 1024;
+    var md5 = new L.MD5Hasher(), sha1 = new L.SHA1Hasher();
+    var parts = [];
+    var offset = 0;
+    var pw = document.getElementById('progress-wrap');
+    var pb = document.getElementById('progress-bar');
+    var pl = document.getElementById('progress-label');
+    pw.classList.remove('hidden');
+    try {
+      while (offset < file.size) {
+        var slice = file.slice(offset, offset + CHUNK);
+        var buf = new Uint8Array(await slice.arrayBuffer());
+        if (buf.length === 0) break;
+        md5.update(buf); sha1.update(buf);
+        parts.push(buf);
+        offset += buf.length;
+        var pct = file.size ? Math.round((offset / file.size) * 100) : 100;
+        pb.style.width = pct + '%';
+        pl.textContent = 'Reading file… ' + pct + '% (' + fmtBytes(offset) + ' / ' + fmtBytes(file.size) + ')';
+        await new Promise(function (r) { setTimeout(r, 0); });
+      }
+      pl.textContent = 'Finalizing digests…';
+      var total = new Uint8Array(file.size);
+      var p = 0;
+      for (var i = 0; i < parts.length; i++) { total.set(parts[i], p); p += parts[i].length; }
+      var out = { md5: md5.digest(), sha1: sha1.digest() };
+      if (window.crypto && crypto.subtle) {
+        var r2 = await Promise.all([
+          sha2hex(total, 'SHA-256'), sha2hex(total, 'SHA-384'), sha2hex(total, 'SHA-512')
+        ]);
+        out.sha256 = r2[0]; out.sha384 = r2[1]; out.sha512 = r2[2];
+      } else {
+        out.sha256 = out.sha384 = out.sha512 = 'unavailable — SHA-2 needs a secure context (HTTPS or localhost)';
+      }
+      state.hashes = out;
+      state.fileName = file.name; state.fileSize = file.size;
+      var fm = document.getElementById('file-meta');
+      fm.classList.remove('hidden');
+      fm.innerHTML = 'Hashed: <span class="text-stone-200 font-semibold">' + escapeHtml(file.name) + '</span> &middot; ' + fmtBytes(file.size);
+      renderCards();
+      pl.textContent = 'Done — ' + fmtBytes(file.size) + ' hashed in chunks.';
+      pb.style.width = '100%';
+    } catch (err) {
+      pl.textContent = 'Error reading file: ' + (err && err.message ? err.message : err);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  /* ---------- verdict ---------- */
+  window.verifyNow = function () {
+    var box = document.getElementById('verdict-box');
+    var exp = document.getElementById('expected-input').value;
+    box.classList.remove('hidden');
+    if (!state.hashes) {
+      box.className = 'mt-3 rounded-xl p-4 text-sm bg-stone-100 text-stone-600 ring-1 ring-stone-200';
+      box.innerHTML = '<strong>Nothing to compare yet.</strong> Hash some text or a file first, then paste the expected checksum.';
+      return;
+    }
+    var norm = L.normalizeHash(exp);
+    if (!norm) {
+      box.className = 'mt-3 rounded-xl p-4 text-sm bg-stone-100 text-stone-600 ring-1 ring-stone-200';
+      box.innerHTML = 'Paste an expected hash above, then press Verify.';
+      return;
+    }
+    if (!L.isHexString(norm)) {
+      box.className = 'mt-3 rounded-xl p-4 text-sm bg-amber-50 text-amber-800 ring-1 ring-amber-200';
+      box.innerHTML = '<strong class="font-bold">⚠ Not a valid hash.</strong> Expected value contains non-hexadecimal characters. Hashes use only 0–9 and a–f.';
+      return;
+    }
+    var detected = L.detectAlgorithm(norm);
+    var matchedAlgo = null, match = false;
+    if (detected) {
+      var key = { 'MD5': 'md5', 'SHA-1': 'sha1', 'SHA-256': 'sha256', 'SHA-384': 'sha384', 'SHA-512': 'sha512' }[detected.algorithm];
+      var cmp = L.compareHashes(state.hashes[key], norm);
+      match = cmp.match; matchedAlgo = detected.algorithm;
+    } else {
+      // unknown length — compare against all five
+      var keys = ['md5', 'sha1', 'sha256', 'sha384', 'sha512'];
+      for (var i = 0; i < keys.length; i++) {
+        if (L.compareHashes(state.hashes[keys[i]], norm).match) {
+          match = true;
+          matchedAlgo = ALGOS[i].name + ' (by value match)';
+          break;
+        }
+      }
+    }
+    if (match) {
+      box.className = 'mt-3 rounded-xl p-4 text-sm bg-green-50 text-green-900 ring-1 ring-green-300';
+      box.innerHTML = '<p class="text-lg font-extrabold text-green-700">✓ MATCH</p>' +
+        '<p class="mt-1">The expected hash is identical to the computed <strong>' + escapeHtml(matchedAlgo) + '</strong> digest. Integrity confirmed.</p>' +
+        '<p class="mt-2 hash-mono text-xs text-green-800 break-all">' + escapeHtml(norm) + '</p>';
+    } else {
+      box.className = 'mt-3 rounded-xl p-4 text-sm bg-red-50 text-red-900 ring-1 ring-red-300';
+      box.innerHTML = '<p class="text-lg font-extrabold text-red-700">✗ MISMATCH</p>' +
+        '<p class="mt-1">The expected hash does <strong>not</strong> match the computed digest' +
+        (detected ? ' for <strong>' + escapeHtml(detected.algorithm) + '</strong> (auto-detected from ' + detected.hexLength + ' hex characters)' : ' for any of the five algorithms') +
+        '. The data was altered or corrupted — do not trust it.</p>';
+    }
+  };
+  document.getElementById('expected-input').addEventListener('input', function () {
+    var v = document.getElementById('expected-input').value.trim();
+    if (v) window.verifyNow();
+    else document.getElementById('verdict-box').classList.add('hidden');
+  });
+
+  /* ---------- identify mode ---------- */
+  document.getElementById('identify-input').addEventListener('input', function () {
+    var box = document.getElementById('identify-result');
+    var raw = document.getElementById('identify-input').value;
+    var norm = L.normalizeHash(raw);
+    if (!norm) { box.innerHTML = ''; return; }
+    if (!L.isHexString(norm)) {
+      box.innerHTML = '<div class="rounded-xl bg-amber-400/10 ring-1 ring-amber-400/40 p-4 text-sm text-amber-200"><strong>⚠ Not hexadecimal.</strong> A hash digest contains only 0–9 and a–f. (' + norm.length + ' chars entered)</div>';
+      return;
+    }
+    var d = L.detectAlgorithm(norm);
+    if (d) {
+      var legacy = (d.algorithm === 'MD5' || d.algorithm === 'SHA-1');
+      box.innerHTML = '<div class="rounded-xl bg-black/40 ring-1 ring-amber-400/40 p-4">' +
+        '<p class="text-xs uppercase tracking-wider text-stone-400">Most likely algorithm</p>' +
+        '<p class="mt-1 text-2xl font-extrabold text-amber-300">' + d.algorithm + '</p>' +
+        '<p class="mt-1 text-sm text-stone-300">' + d.bits + '-bit digest &middot; ' + d.hexLength + ' hex characters</p>' +
+        '<p class="mt-2 text-xs ' + (legacy ? 'text-red-300' : 'text-green-300') + '">' + (legacy ? '⚠ ' : '✓ ') + escapeHtml(d.note) + '</p></div>';
+    } else {
+      box.innerHTML = '<div class="rounded-xl bg-black/40 ring-1 ring-stone-600 p-4 text-sm text-stone-300"><strong class="text-stone-100">Unknown length.</strong> ' + norm.length + ' hex characters doesn\'t match MD5 (32), SHA-1 (40), SHA-256 (64), SHA-384 (96) or SHA-512 (128). It may be truncated, salted, or a different construction (e.g. bcrypt, HMAC).</div>';
+    }
+  });
+
+  /* ---------- mode tabs ---------- */
+  window.setMode = function (mode) {
+    state.mode = mode;
+    ['text', 'file', 'identify'].forEach(function (m) {
+      document.getElementById('tab-' + m).className = (m === mode ? 'tab-active' : 'tab-idle') + ' rounded-md px-3 sm:px-4 py-2 transition';
+      document.getElementById('pane-' + m).classList.toggle('hidden', m !== mode);
+    });
+    try { localStorage.setItem('hexsum-mode', mode); } catch (e) {}
+  };
+
+  /* ---------- init ---------- */
+  try {
+    var savedCase = localStorage.getItem('hexsum-case');
+    if (savedCase === 'upper') { state.upper = true; document.getElementById('case-btn').textContent = 'lowercase'; }
+    var savedMode = localStorage.getItem('hexsum-mode');
+    if (savedMode === 'file' || savedMode === 'identify') window.setMode(savedMode);
+  } catch (e) {}
+  renderCards();
+})();
+</script>
+</body>
+</html>
